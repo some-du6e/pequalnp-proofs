@@ -1,0 +1,105 @@
+# Fork-only: build-check one proof branch with the project's own checker, before opening the PR.
+# Run: gh workflow run pnp-check.yml -R some-du6e/pequalnp-proofs -f branch=L-xxx-12
+name: pnp-check
+run-name: check ${{ inputs.branch }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: proof branch (L-<prog>-<n>)
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pnp-check-${{ inputs.branch }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      BRANCH: ${{ inputs.branch }}
+      GAPS_URL: https://data.pequalnp.com/data/desk/gaps.json
+    steps:
+      - name: Fetch the branch
+        run: |
+          set -eu
+          printf '%s' "$BRANCH" | grep -Eqx 'L-[a-z]+-[0-9]+' || { echo "bad branch"; exit 1; }
+          git init -q .
+          git fetch -q "https://github.com/${GITHUB_REPOSITORY}.git" "$BRANCH"
+          git checkout -q --detach FETCH_HEAD
+          git fetch -q https://github.com/open-goat/pequalnp-proofs.git main
+          echo "changed vs upstream main:"; git diff --name-status FETCH_HEAD HEAD
+          file=$(git diff --name-only --diff-filter=A FETCH_HEAD HEAD | grep '^lean/PEqualNP/Outside/L_' | head -1)
+          [ -n "$file" ] || { echo "no proof file on this branch"; exit 1; }
+          n=$(git diff --name-only FETCH_HEAD HEAD | wc -l)
+          [ "$n" -eq 1 ] || echo "WARNING: branch changes $n files vs upstream main; the PR must add exactly one"
+          echo "FILE=$file" >> "$GITHUB_ENV"
+
+      - name: The posted statement and the import rule
+        run: |
+          set -eu
+          mkdir -p "$RUNNER_TEMP/in"
+          curl -sSf --proto '=https' --max-redirs 0 --max-filesize 5000000 -o "$RUNNER_TEMP/in/gaps.json" "$GAPS_URL"
+          node .github/scripts/outside-guard.mjs gap-of-file "$RUNNER_TEMP/in/gaps.json" "$FILE" "$RUNNER_TEMP/in"
+          node .github/scripts/outside-guard.mjs imports "$FILE" "$RUNNER_TEMP/in/imports.json" "$FILE"
+          echo "gap: $(cat "$RUNNER_TEMP/in/gap.id")"
+
+      - name: Install the pinned Lean toolchain
+        run: |
+          set -eu
+          curl -sSfL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+          "$HOME/.elan/bin/elan" toolchain install "$(cat lean/lean-toolchain)"
+
+      - name: Fetch the prebuilt Mathlib
+        working-directory: lean
+        run: lake exe cache get
+
+      - name: Swap space for the verifier
+        run: |
+          set -eu
+          # The verifier needs more memory than a standard runner has for a proof that imports
+          # all of Mathlib; without swap the run hangs (see authoritative.yml, the same step).
+          sudo rm -rf /usr/local/lib/android /opt/ghc /usr/local/.ghcup /usr/share/swift /opt/hostedtoolcache/CodeQL
+          d=$(df -m --output=avail,target / /mnt 2>/dev/null | awk 'NR>1' | sort -rn | awk 'NR==1{print $2}')
+          mb=$(( $(df -m --output=avail "$d" | awk 'NR==2{print $1}') - 6144 ))
+          [ "$mb" -le 12288 ] || mb=12288
+          if [ "$mb" -ge 1024 ]; then
+            f="${d%/}/pnp-swap"
+            sudo fallocate -l "${mb}M" "$f" && sudo chmod 600 "$f"
+            sudo mkswap -q "$f" && sudo swapon "$f"
+          fi
+          free -m
+
+      - name: Run the checker
+        timeout-minutes: 25
+        run: |
+          set -u
+          # The machine the authoritative check runs on (authoritative.yml, the same step): two
+          # cores, at most 6.5 GB of memory with the rest in swap, and 20 minutes. Without
+          # them the 4 core, 16 GB runner starved and lost contact with GitHub, with no log.
+          cap=$(( $(awk '/^MemTotal:/{print $2}' /proc/meminfo) - 1572864 ))
+          [ "$cap" -le 6815744 ] || cap=6815744
+          sudo systemd-run --quiet --scope --collect -p MemoryMax="${cap}K" --uid="$(id -u)" --gid="$(id -g)" \
+            env HOME="$HOME" PATH="$PATH" taskset -c 0,1 timeout -k 30 1200 \
+            node tools/check-lean.mjs "$FILE" "$RUNNER_TEMP/in/statement.txt" check > "$RUNNER_TEMP/out" 2> "$RUNNER_TEMP/err"
+          code=$?
+          case "$code" in 124|137) echo "the checker was stopped after 20 minutes" >> "$RUNNER_TEMP/err" ;; esac
+          pkill -KILL -f "lean/.lake/build/bin/checklemma" || true
+          # The output can quote the proof file, so it is printed with workflow commands switched off.
+          stop="stop-$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+          echo "::stop-commands::$stop"
+          tail -n 40 "$RUNNER_TEMP/err"
+          tail -n 60 "$RUNNER_TEMP/out"
+          echo "::$stop::"
+          case "$code" in
+            0) echo "ADVISORY VERDICT: ACCEPTED (advisory only: the check that counts runs from the base branch)" ;;
+            1) echo "ADVISORY VERDICT: REJECTED (the last line above says why)" ;;
+            *) echo "ADVISORY VERDICT: the checker could not run (exit $code)" ;;
+          esac
+          exit "$code"
