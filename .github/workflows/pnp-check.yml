@@ -78,8 +78,10 @@ jobs:
 
       - name: Run the checker
         timeout-minutes: 25
+        shell: bash {0}
         run: |
           set -u
+          code=0
           # The machine the authoritative check runs on (authoritative.yml, the same step): two
           # cores, at most 6.5 GB of memory with the rest in swap, and 20 minutes. Without
           # them the 4 core, 16 GB runner starved and lost contact with GitHub, with no log.
@@ -87,15 +89,14 @@ jobs:
           [ "$cap" -le 6815744 ] || cap=6815744
           sudo systemd-run --quiet --scope --collect -p MemoryMax="${cap}K" --uid="$(id -u)" --gid="$(id -g)" \
             env HOME="$HOME" PATH="$PATH" taskset -c 0,1 timeout -k 30 1200 \
-            node tools/check-lean.mjs "$FILE" "$RUNNER_TEMP/in/statement.txt" check > "$RUNNER_TEMP/out" 2> "$RUNNER_TEMP/err"
-          code=$?
+            node tools/check-lean.mjs "$FILE" "$RUNNER_TEMP/in/statement.txt" check > "$RUNNER_TEMP/out" 2> "$RUNNER_TEMP/err" || code=$?
           case "$code" in 124|137) echo "the checker was stopped after 20 minutes" >> "$RUNNER_TEMP/err" ;; esac
           pkill -KILL -f "lean/.lake/build/bin/checklemma" || true
           # The output can quote the proof file, so it is printed with workflow commands switched off.
           stop="stop-$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
           echo "::stop-commands::$stop"
-          tail -n 40 "$RUNNER_TEMP/err"
-          tail -n 60 "$RUNNER_TEMP/out"
+          tail -n 150 "$RUNNER_TEMP/err"
+          tail -n 150 "$RUNNER_TEMP/out"
           echo "::$stop::"
           case "$code" in
             0) echo "ADVISORY VERDICT: ACCEPTED (advisory only: the check that counts runs from the base branch)" ;;
