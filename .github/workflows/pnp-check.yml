@@ -44,7 +44,7 @@ jobs:
         run: |
           set -eu
           mkdir -p "$RUNNER_TEMP/in"
-          curl -sSf --proto '=https' --max-redirs 0 --max-filesize 5000000 -o "$RUNNER_TEMP/in/gaps.json" "$GAPS_URL"
+          curl -sSf --proto '=https' --max-redirs 0 --max-filesize 100000000 -o "$RUNNER_TEMP/in/gaps.json" "$GAPS_URL"
           node .github/scripts/outside-guard.mjs gap-of-file "$RUNNER_TEMP/in/gaps.json" "$FILE" "$RUNNER_TEMP/in"
           node .github/scripts/outside-guard.mjs imports "$FILE" "$RUNNER_TEMP/in/imports.json" "$FILE"
           echo "gap: $(cat "$RUNNER_TEMP/in/gap.id")"
